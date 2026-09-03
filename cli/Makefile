@@ -7,7 +7,9 @@ SRC = monitor_cli.c
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -I../include -o $(TARGET) $(SRC)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
 
 clean:
 	rm -f $(TARGET)
+
+.PHONY: all clean
