@@ -12,11 +12,33 @@
 #define SERVER_PORT 5000
 #define BACKLOG 16
 
+/*
+ * Set a socket/file descriptor to non-blocking mode.
+ *
+ * Returns:
+ *   0  -> success
+ *  -1  -> failure
+ */
+static int set_nonblocking(int fd)
+{
+    int flags;
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
 int main(void)
 {
     int server_fd;
     int opt = 1;
-    int flags;
 
     struct sockaddr_in server_addr;
 
@@ -73,21 +95,10 @@ int main(void)
     }
 
     /*
-     * 6. Get the current file status flags.
+     * 6. Set the listening socket to non-blocking mode.
      */
-    flags = fcntl(server_fd, F_GETFL, 0);
-
-    if (flags < 0) {
-        perror("fcntl(F_GETFL)");
-        close(server_fd);
-        return EXIT_FAILURE;
-    }
-
-    /*
-     * 7. Enable non-blocking mode on the listening socket.
-     */
-    if (fcntl(server_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        perror("fcntl(F_SETFL)");
+    if (set_nonblocking(server_fd) < 0) {
+        perror("fcntl(server_fd)");
         close(server_fd);
         return EXIT_FAILURE;
     }
@@ -96,7 +107,7 @@ int main(void)
     printf("Listening socket is non-blocking\n");
 
     /*
-     * 8. Try to accept incoming clients.
+     * 7. Accept incoming TCP clients.
      */
     while (1) {
         struct sockaddr_in client_addr;
@@ -108,12 +119,11 @@ int main(void)
                            &client_addr_len);
 
         if (client_fd < 0) {
+
             /*
-             * Because the listening socket is non-blocking,
-             * accept() returns immediately when no client
-             * is waiting.
-             *
-             * EAGAIN / EWOULDBLOCK is therefore expected.
+             * No client is waiting right now.
+             * This is expected for a non-blocking
+             * listening socket.
              */
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 usleep(100000);
@@ -122,7 +132,7 @@ int main(void)
 
             /*
              * accept() may be interrupted by a signal.
-             * In that case, simply try again.
+             * Retry in that case.
              */
             if (errno == EINTR) {
                 continue;
@@ -135,13 +145,25 @@ int main(void)
             break;
         }
 
+        /*
+         * 8. Set the accepted client socket to
+         * non-blocking mode as well.
+         */
+        if (set_nonblocking(client_fd) < 0) {
+            perror("fcntl(client_fd)");
+            close(client_fd);
+            continue;
+        }
+
         printf("Client connected. fd = %d\n", client_fd);
+        printf("Client socket is non-blocking\n");
 
         /*
          * Client communication is outside the scope
          * of the current task.
          *
-         * We accept the connection and close it for now.
+         * RX/TX handling and the event loop will be
+         * implemented in later tasks.
          */
         close(client_fd);
     }
