@@ -11,16 +11,47 @@
 
 #define INPUT_BUFFER_SIZE 4096
 #define RX_BUFFER_SIZE 8192
+#define UDP_BUFFER_SIZE 2048
 
-static int send_all(int sockfd, const char *buffer, size_t length)
+/*
+ * Parse and validate a TCP/UDP port.
+ */
+static int parse_port(const char *text)
+{
+    char *end;
+    long value;
+
+    errno = 0;
+    value = strtol(text, &end, 10);
+
+    if (errno != 0 ||
+        end == text ||
+        *end != '\0' ||
+        value <= 0 ||
+        value > 65535) {
+
+        return -1;
+    }
+
+    return (int)value;
+}
+
+/*
+ * Send the complete TCP buffer.
+ */
+static int send_all(int sockfd,
+                    const char *buffer,
+                    size_t length)
 {
     size_t total_sent = 0;
 
     while (total_sent < length) {
-        ssize_t sent = send(sockfd,
-                            buffer + total_sent,
-                            length - total_sent,
-                            0);
+        ssize_t sent;
+
+        sent = send(sockfd,
+                    buffer + total_sent,
+                    length - total_sent,
+                    0);
 
         if (sent < 0) {
             if (errno == EINTR) {
@@ -32,7 +63,8 @@ static int send_all(int sockfd, const char *buffer, size_t length)
         }
 
         if (sent == 0) {
-            fprintf(stderr, "Connection closed while sending\n");
+            fprintf(stderr,
+                    "Connection closed while sending\n");
             return -1;
         }
 
@@ -42,7 +74,14 @@ static int send_all(int sockfd, const char *buffer, size_t length)
     return 0;
 }
 
-static int process_rx_buffer(char *buffer, size_t *buffer_len)
+/*
+ * Print all complete newline-terminated messages
+ * currently available in the TCP RX buffer.
+ *
+ * Any incomplete message remains in the buffer.
+ */
+static void process_rx_buffer(char *buffer,
+                              size_t *buffer_len)
 {
     size_t start = 0;
     size_t i;
@@ -59,10 +98,6 @@ static int process_rx_buffer(char *buffer, size_t *buffer_len)
         }
     }
 
-    /*
-     * Move incomplete trailing data to the beginning
-     * of the buffer.
-     */
     if (start > 0) {
         size_t remaining = *buffer_len - start;
 
@@ -72,17 +107,158 @@ static int process_rx_buffer(char *buffer, size_t *buffer_len)
 
         *buffer_len = remaining;
     }
+}
+
+/*
+ * Validate UDP telemetry format:
+ *
+ * STAT <udp_seq> <last_seq> <last_value_mC>
+ *      <last_alarm> <dropped_total> <running>
+ */
+static int validate_stat_message(const char *message)
+{
+    unsigned long long udp_seq;
+    unsigned long long last_seq;
+    int last_value_mC;
+    unsigned int last_alarm;
+    unsigned long long dropped_total;
+    unsigned int running;
+    char extra[32];
+
+    int matched;
+
+    matched = sscanf(message,
+                     "STAT %llu %llu %d %u %llu %u %31s",
+                     &udp_seq,
+                     &last_seq,
+                     &last_value_mC,
+                     &last_alarm,
+                     &dropped_total,
+                     &running,
+                     extra);
+
+    /*
+     * Exactly 6 values must follow STAT.
+     *
+     * If a seventh token exists, sscanf returns 7.
+     */
+    if (matched != 6) {
+        return -1;
+    }
+
+    if (last_alarm > 1 || running > 1) {
+        return -1;
+    }
 
     return 0;
 }
 
-int main(int argc, char *argv[])
+/*
+ * UDP telemetry listening mode.
+ */
+static int run_udp_mode(int port)
 {
     int sockfd;
-    int port;
+    struct sockaddr_in local_addr;
+
+    sockfd = socket(AF_INET,
+                    SOCK_DGRAM,
+                    0);
+
+    if (sockfd < 0) {
+        perror("socket");
+        return EXIT_FAILURE;
+    }
+
+    memset(&local_addr,
+           0,
+           sizeof(local_addr));
+
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    local_addr.sin_port = htons((unsigned short)port);
+
+    if (bind(sockfd,
+             (struct sockaddr *)&local_addr,
+             sizeof(local_addr)) < 0) {
+
+        perror("bind");
+        close(sockfd);
+        return EXIT_FAILURE;
+    }
+
+    printf("Listening for UDP telemetry on port %d\n",
+           port);
+
+    printf("Press Ctrl+C to stop.\n");
+
+    for (;;) {
+        char buffer[UDP_BUFFER_SIZE];
+
+        struct sockaddr_in sender_addr;
+        socklen_t sender_len = sizeof(sender_addr);
+
+        ssize_t received;
+
+        received = recvfrom(sockfd,
+                            buffer,
+                            sizeof(buffer) - 1,
+                            MSG_TRUNC,
+                            (struct sockaddr *)&sender_addr,
+                            &sender_len);
+
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            perror("recvfrom");
+            close(sockfd);
+            return EXIT_FAILURE;
+        }
+
+        /*
+         * MSG_TRUNC allows us to detect a datagram
+         * larger than our receive buffer.
+         */
+        if ((size_t)received >= sizeof(buffer)) {
+            fprintf(stderr,
+                    "Dropped oversized UDP datagram\n");
+            continue;
+        }
+
+        buffer[received] = '\0';
+
+        /*
+         * Remove a trailing newline if one exists.
+         */
+        if (received > 0 &&
+            buffer[received - 1] == '\n') {
+
+            buffer[received - 1] = '\0';
+        }
+
+        if (validate_stat_message(buffer) < 0) {
+            fprintf(stderr,
+                    "Malformed telemetry packet: %s\n",
+                    buffer);
+
+            continue;
+        }
+
+        printf("%s\n", buffer);
+    }
+}
+
+/*
+ * Existing TCP + WATCH mode.
+ */
+static int run_tcp_mode(const char *server_ip,
+                        int port)
+{
+    int sockfd;
 
     struct sockaddr_in server_addr;
-
     struct pollfd fds[2];
 
     char input_buffer[INPUT_BUFFER_SIZE];
@@ -90,43 +266,30 @@ int main(int argc, char *argv[])
 
     size_t rx_len = 0;
 
-    if (argc != 3) {
-        fprintf(stderr,
-                "Usage: %s <server_ip> <port>\n",
-                argv[0]);
-
-        return EXIT_FAILURE;
-    }
-
-    port = atoi(argv[2]);
-
-    if (port <= 0 || port > 65535) {
-        fprintf(stderr,
-                "Invalid port: %s\n",
-                argv[2]);
-
-        return EXIT_FAILURE;
-    }
-
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    sockfd = socket(AF_INET,
+                    SOCK_STREAM,
+                    0);
 
     if (sockfd < 0) {
         perror("socket");
         return EXIT_FAILURE;
     }
 
-    memset(&server_addr, 0, sizeof(server_addr));
+    memset(&server_addr,
+           0,
+           sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons((unsigned short)port);
+    server_addr.sin_port =
+        htons((unsigned short)port);
 
     if (inet_pton(AF_INET,
-                  argv[1],
+                  server_ip,
                   &server_addr.sin_addr) != 1) {
 
         fprintf(stderr,
                 "Invalid IPv4 address: %s\n",
-                argv[1]);
+                server_ip);
 
         close(sockfd);
         return EXIT_FAILURE;
@@ -143,14 +306,14 @@ int main(int argc, char *argv[])
     }
 
     printf("Connected to %s:%d\n",
-           argv[1],
+           server_ip,
            port);
 
     printf("Enter commands. Ctrl+D to exit.\n");
 
     /*
-     * poll fd #0 -> stdin
-     * poll fd #1 -> TCP socket
+     * fd 0 -> stdin
+     * fd 1 -> TCP socket
      */
     fds[0].fd = STDIN_FILENO;
     fds[0].events = POLLIN;
@@ -161,7 +324,9 @@ int main(int argc, char *argv[])
     for (;;) {
         int ready;
 
-        ready = poll(fds, 2, -1);
+        ready = poll(fds,
+                     2,
+                     -1);
 
         if (ready < 0) {
             if (errno == EINTR) {
@@ -194,15 +359,17 @@ int main(int argc, char *argv[])
         }
 
         /*
-         * Handle stdin close/error.
+         * stdin closed/error.
          */
-        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        if (fds[0].revents &
+            (POLLERR | POLLHUP | POLLNVAL)) {
+
             printf("Standard input closed\n");
             break;
         }
 
         /*
-         * Server sent data.
+         * Server sent TCP data.
          */
         if (fds[1].revents & POLLIN) {
 
@@ -211,7 +378,8 @@ int main(int argc, char *argv[])
 
                 if (rx_len >= sizeof(rx_buffer)) {
                     fprintf(stderr,
-                            "Receive buffer overflow\n");
+                            "TCP receive buffer overflow\n");
+
                     close(sockfd);
                     return EXIT_FAILURE;
                 }
@@ -256,7 +424,7 @@ int main(int argc, char *argv[])
         }
 
         /*
-         * Server connection error/hangup.
+         * TCP connection closed/error.
          */
         if (fds[1].revents &
             (POLLERR | POLLHUP | POLLNVAL)) {
@@ -269,4 +437,60 @@ int main(int argc, char *argv[])
     close(sockfd);
 
     return EXIT_SUCCESS;
+}
+
+int main(int argc, char *argv[])
+{
+    int port;
+
+    /*
+     * UDP mode:
+     *
+     * ./monitor_cli --udp 5001
+     */
+    if (argc == 3 &&
+        strcmp(argv[1], "--udp") == 0) {
+
+        port = parse_port(argv[2]);
+
+        if (port < 0) {
+            fprintf(stderr,
+                    "Invalid UDP port: %s\n",
+                    argv[2]);
+
+            return EXIT_FAILURE;
+        }
+
+        return run_udp_mode(port);
+    }
+
+    /*
+     * TCP mode:
+     *
+     * ./monitor_cli 127.0.0.1 5000
+     */
+    if (argc == 3) {
+
+        port = parse_port(argv[2]);
+
+        if (port < 0) {
+            fprintf(stderr,
+                    "Invalid TCP port: %s\n",
+                    argv[2]);
+
+            return EXIT_FAILURE;
+        }
+
+        return run_tcp_mode(argv[1],
+                            port);
+    }
+
+    fprintf(stderr,
+            "Usage:\n"
+            "  %s <server_ip> <tcp_port>\n"
+            "  %s --udp <udp_port>\n",
+            argv[0],
+            argv[0]);
+
+    return EXIT_FAILURE;
 }
