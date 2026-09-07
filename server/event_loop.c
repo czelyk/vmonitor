@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -100,7 +101,15 @@ static int accept_clients(int epoll_fd, int server_fd)
 
         memset(&event, 0, sizeof(event));
 
-        event.events = EPOLLIN;
+        /*
+         * EPOLLIN:
+         *   Notify us when the client socket becomes readable.
+         *
+         * EPOLLRDHUP:
+         *   Notify us when the peer closes its side of the
+         * TCP connection.
+         */
+        event.events = EPOLLIN | EPOLLRDHUP;
         event.data.fd = client_fd;
 
         /*
@@ -162,7 +171,7 @@ int event_loop_run(int server_fd)
         int i;
 
         /*
-         * Sleep here until one or more registered
+         * Wait until one or more registered
          * file descriptors have an event.
          */
         ready = epoll_wait(epoll_fd,
@@ -221,16 +230,33 @@ int event_loop_run(int server_fd)
             /*
              * From this point onward, the event belongs
              * to an accepted client socket.
+             *
+             * EPOLLERR:
+             *   Socket error.
+             *
+             * EPOLLHUP:
+             *   Socket hangup.
+             *
+             * EPOLLRDHUP:
+             *   Peer closed its side of the TCP connection.
              */
+            if (event_flags &
+                (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
 
-            if (event_flags & (EPOLLERR | EPOLLHUP)) {
-
-                printf("Client error/hangup. fd = %d\n", fd);
+                printf("Client disconnected/error. fd = %d\n",
+                       fd);
 
                 remove_client(epoll_fd, fd);
                 continue;
             }
 
+            /*
+             * Client socket contains readable data.
+             *
+             * For this task we only detect disconnects.
+             * RX buffering and command parsing belong
+             * to the next task.
+             */
             if (event_flags & EPOLLIN) {
                 struct client *client;
                 int result;
