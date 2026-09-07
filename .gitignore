@@ -12,3 +12,4 @@
 
 # Editor
 .vscode/
+*.code-workspace
