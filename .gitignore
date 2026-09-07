@@ -1,0 +1,14 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.tmp_versions/
+*.cmd
+.*.cmd
+
+# Editor
+.vscode/
