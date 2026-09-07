@@ -51,6 +51,16 @@ int main(void)
     n = read(fd, &out, sizeof(out));
     check(n == 0, "bos kuyrukta read() 0 donuyor");
 
+    /* Kesin boyut kontrolu: eksik/fazla byte ile read/write artik -EINVAL vermeli */
+    {
+        char small_buf[10];
+        n = read(fd, small_buf, sizeof(small_buf));
+        check(n < 0 && errno == EINVAL, "read() count != 24 icin -EINVAL donuyor");
+
+        n = write(fd, small_buf, sizeof(small_buf));
+        check(n < 0 && errno == EINVAL, "write() count != 24 icin -EINVAL donuyor");
+    }
+
     /* 2) Fill the queue completely (64 entries), then overflow it */
     for (int i = 0; i < 64; i++) {
         in = make_sample(10000 + i, 0);

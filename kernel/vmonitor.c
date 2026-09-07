@@ -97,18 +97,30 @@ static bool queue_push(struct vmonitor_queue *q, const struct vmonitor_sample *s
 }
 
 /*
- * Pop the oldest sample from the queue.
- * Returns true if a sample was popped, false if the queue was empty.
+ * Peek at the oldest sample WITHOUT removing it from the queue.
+ * Returns true if a sample was available, false if the queue was empty.
+ * Used by read() so we only commit the removal after copy_to_user()
+ * has succeeded -- otherwise a bad user pointer would silently discard
+ * data and inflate read_total for a read that never actually happened.
  */
-static bool queue_pop(struct vmonitor_queue *q, struct vmonitor_sample *out)
+static bool queue_peek(struct vmonitor_queue *q, struct vmonitor_sample *out)
 {
     if (queue_is_empty(q))
         return false;
 
     *out = q->items[q->head];
+    return true;
+}
+
+/*
+ * Remove the oldest sample from the queue without copying it out
+ * (the caller already has a copy from queue_peek()). Caller must have
+ * already verified the queue is non-empty.
+ */
+static void queue_advance(struct vmonitor_queue *q)
+{
     q->head = (q->head + 1) % QUEUE_CAPACITY;
     q->count--;
-    return true;
 }
 
 /* ---- file_operations ---- */
@@ -133,9 +145,24 @@ static int vmonitor_release(struct inode *inode, struct file *filp)
 }
 
 /*
- * read(): pops one struct vmonitor_sample (24 bytes) from the queue and
- * copies it to userspace. If the queue is empty, returns 0 (EOF-style,
- * no blocking yet -- poll()/wait queue will be added in a later task).
+ * read(): copies the oldest sample to userspace via copy_to_user() and
+ * only THEN removes it from the queue and increments read_total.
+ *
+ * This ordering matters: if we removed the sample first and copy_to_user()
+ * failed afterwards (e.g. bad user pointer), the sample would be silently
+ * lost and read_total would count a read that never actually delivered
+ * data to userspace. Peeking first, copying, and only committing the
+ * removal on success avoids that.
+ *
+ * If the queue is empty, returns 0 (no blocking yet -- poll()/wait queue
+ * is a later task). count must be exactly sizeof(struct vmonitor_sample);
+ * anything else is -EINVAL.
+ *
+ * Note on the peek-then-advance gap: this is safe from a second concurrent
+ * read() racing on the same head element because the driver's single-open
+ * lock (see vmonitor_open()) guarantees only one process can have the
+ * device open -- and therefore only one caller can be inside read() -- at
+ * any given time.
  */
 static ssize_t vmonitor_read(struct file *filp, char __user *buf,
                               size_t count, loff_t *ppos)
@@ -143,22 +170,26 @@ static ssize_t vmonitor_read(struct file *filp, char __user *buf,
     struct vmonitor_dev *dev = filp->private_data;
     struct vmonitor_sample sample;
     unsigned long flags;
-    bool got;
+    bool available;
 
-    if (count < sizeof(sample))
+    if (count != sizeof(sample))
         return -EINVAL;
 
     spin_lock_irqsave(&dev->lock, flags);
-    got = queue_pop(&dev->queue, &sample);
-    if (got)
-        dev->read_total++;
+    available = queue_peek(&dev->queue, &sample);
     spin_unlock_irqrestore(&dev->lock, flags);
 
-    if (!got)
+    if (!available)
         return 0; /* queue empty */
 
     if (copy_to_user(buf, &sample, sizeof(sample)))
-        return -EFAULT;
+        return -EFAULT; /* sample stays in the queue, nothing was lost */
+
+    /* Only now, after the copy succeeded, actually remove it and count it. */
+    spin_lock_irqsave(&dev->lock, flags);
+    queue_advance(&dev->queue);
+    dev->read_total++;
+    spin_unlock_irqrestore(&dev->lock, flags);
 
     return sizeof(sample);
 }
@@ -177,8 +208,9 @@ static ssize_t vmonitor_write(struct file *filp, const char __user *buf,
     unsigned long flags;
     bool pushed;
 
-    /* Validate input size before touching userspace memory */
-    if (count < sizeof(sample))
+    /* Validate input size before touching userspace memory.
+     * Strict semantics: exactly sizeof(struct vmonitor_sample), not "at least". */
+    if (count != sizeof(sample))
         return -EINVAL;
 
     if (copy_from_user(&sample, buf, sizeof(sample)))
