@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <errno.h>
 #include <string.h>
 #include <fcntl.h>
 
@@ -9,21 +8,17 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#include "event_loop.h"
+
 #define SERVER_PORT 5000
 #define BACKLOG 16
 
-/*
- * Set a socket/file descriptor to non-blocking mode.
- *
- * Returns:
- *   0  -> success
- *  -1  -> failure
- */
 static int set_nonblocking(int fd)
 {
     int flags;
 
     flags = fcntl(fd, F_GETFL, 0);
+
     if (flags < 0) {
         return -1;
     }
@@ -60,6 +55,7 @@ int main(void)
                    SO_REUSEADDR,
                    &opt,
                    sizeof(opt)) < 0) {
+
         perror("setsockopt");
         close(server_fd);
         return EXIT_FAILURE;
@@ -75,18 +71,19 @@ int main(void)
     server_addr.sin_port = htons(SERVER_PORT);
 
     /*
-     * 4. Bind the socket to the configured address and port.
+     * 4. Bind the socket to the configured address.
      */
     if (bind(server_fd,
              (struct sockaddr *)&server_addr,
              sizeof(server_addr)) < 0) {
+
         perror("bind");
         close(server_fd);
         return EXIT_FAILURE;
     }
 
     /*
-     * 5. Start listening for incoming TCP connections.
+     * 5. Start listening for TCP connections.
      */
     if (listen(server_fd, BACKLOG) < 0) {
         perror("listen");
@@ -95,7 +92,7 @@ int main(void)
     }
 
     /*
-     * 6. Set the listening socket to non-blocking mode.
+     * 6. The listening socket must be non-blocking.
      */
     if (set_nonblocking(server_fd) < 0) {
         perror("fcntl(server_fd)");
@@ -107,65 +104,11 @@ int main(void)
     printf("Listening socket is non-blocking\n");
 
     /*
-     * 7. Accept incoming TCP clients.
+     * 7. Enter the epoll-based event loop.
      */
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_addr_len = sizeof(client_addr);
-        int client_fd;
-
-        client_fd = accept(server_fd,
-                           (struct sockaddr *)&client_addr,
-                           &client_addr_len);
-
-        if (client_fd < 0) {
-
-            /*
-             * No client is waiting right now.
-             * This is expected for a non-blocking
-             * listening socket.
-             */
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(100000);
-                continue;
-            }
-
-            /*
-             * accept() may be interrupted by a signal.
-             * Retry in that case.
-             */
-            if (errno == EINTR) {
-                continue;
-            }
-
-            /*
-             * Any other accept() error is unexpected.
-             */
-            perror("accept");
-            break;
-        }
-
-        /*
-         * 8. Set the accepted client socket to
-         * non-blocking mode as well.
-         */
-        if (set_nonblocking(client_fd) < 0) {
-            perror("fcntl(client_fd)");
-            close(client_fd);
-            continue;
-        }
-
-        printf("Client connected. fd = %d\n", client_fd);
-        printf("Client socket is non-blocking\n");
-
-        /*
-         * Client communication is outside the scope
-         * of the current task.
-         *
-         * RX/TX handling and the event loop will be
-         * implemented in later tasks.
-         */
-        close(client_fd);
+    if (event_loop_run(server_fd) < 0) {
+        close(server_fd);
+        return EXIT_FAILURE;
     }
 
     close(server_fd);
