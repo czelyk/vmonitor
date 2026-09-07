@@ -3,9 +3,8 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "../include/vmonitor_uapi.h"
 
-// Command enumeration for protocol commands
+// Supported protocol command types
 typedef enum {
     CMD_UNKNOWN = 0,
     CMD_GET,
@@ -13,19 +12,23 @@ typedef enum {
     CMD_STOP,
     CMD_PERIOD,
     CMD_THRESHOLD,
-    CMD_INJECT
+    CMD_INJECT,
+    CMD_WATCH
 } cmd_type_t;
 
-// Structure to hold parsed command parameters
+// Structure holding parsed command data
 typedef struct {
-    uint32_t id;        // Request sequence ID preserved across RSP messages
+    uint32_t id;        // Request ID (<id>)
     cmd_type_t type;    // Parsed command enum
-    int32_t arg;        // Argument value for PERIOD, THRESHOLD, INJECT
+    int32_t arg;        // Argument for PERIOD, THRESHOLD, INJECT, WATCH
     bool has_arg;       // True if an argument was parsed
 } parsed_cmd_t;
 
-// Function prototypes
+/*
+ * Parses a single ASCII command line.
+ * Format: <id> <COMMAND> [arg]
+ * Returns: 0 on success, -1 on syntax error or unsupported command.
+ */
 int parse_command_line(const char *line, parsed_cmd_t *cmd);
-int handle_protocol_command(int client_fd, int vmonitor_fd, const parsed_cmd_t *cmd);
 
 #endif // PROTOCOL_H
