@@ -81,8 +81,8 @@ static int accept_clients(int epoll_fd, int server_fd)
         }
 
         /*
-         * Every accepted client socket must also
-         * operate in non-blocking mode.
+         * Every accepted client socket must operate
+         * in non-blocking mode.
          */
         if (set_nonblocking(client_fd) < 0) {
             perror("fcntl(client_fd)");
@@ -91,7 +91,7 @@ static int accept_clients(int epoll_fd, int server_fd)
         }
 
         /*
-         * Create client state.
+         * Create per-client state.
          */
         if (client_add(client_fd) < 0) {
             perror("client_add");
@@ -107,7 +107,7 @@ static int accept_clients(int epoll_fd, int server_fd)
          *
          * EPOLLRDHUP:
          *   Notify us when the peer closes its side of the
-         * TCP connection.
+         *   TCP connection.
          */
         event.events = EPOLLIN | EPOLLRDHUP;
         event.data.fd = client_fd;
@@ -171,8 +171,8 @@ int event_loop_run(int server_fd)
         int i;
 
         /*
-         * Wait until one or more registered
-         * file descriptors have an event.
+         * Wait until one or more registered file
+         * descriptors have an event.
          */
         ready = epoll_wait(epoll_fd,
                            events,
@@ -228,34 +228,24 @@ int event_loop_run(int server_fd)
             }
 
             /*
-             * From this point onward, the event belongs
-             * to an accepted client socket.
+             * A socket error makes the client unusable.
              *
-             * EPOLLERR:
-             *   Socket error.
-             *
-             * EPOLLHUP:
-             *   Socket hangup.
-             *
-             * EPOLLRDHUP:
-             *   Peer closed its side of the TCP connection.
+             * Hangup events are handled later so that
+             * readable data delivered with the same
+             * epoll event is processed first.
              */
-            if (event_flags &
-                (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-
-                printf("Client disconnected/error. fd = %d\n",
-                       fd);
+            if (event_flags & EPOLLERR) {
+                printf("Client error. fd = %d\n", fd);
 
                 remove_client(epoll_fd, fd);
                 continue;
             }
 
             /*
-             * Client socket contains readable data.
-             *
-             * For this task we only detect disconnects.
-             * RX buffering and command parsing belong
-             * to the next task.
+             * Process readable client data before handling
+             * hangup events. This ensures that pending bytes
+             * are not discarded when EPOLLIN and EPOLLRDHUP
+             * are reported together.
              */
             if (event_flags & EPOLLIN) {
                 struct client *client;
@@ -282,8 +272,8 @@ int event_loop_run(int server_fd)
                 if (result > 0) {
 
                     /*
-                     * recv() returned 0:
-                     * peer disconnected normally.
+                     * recv() returned zero, which means
+                     * the peer closed the connection.
                      */
                     printf("Client disconnected. fd = %d\n",
                            fd);
@@ -293,11 +283,28 @@ int event_loop_run(int server_fd)
                 }
 
                 if (result < 0) {
+
+                    /*
+                     * A receive error or oversized command
+                     * requires the client to be disconnected.
+                     */
                     perror("recv");
 
                     remove_client(epoll_fd, fd);
                     continue;
                 }
+            }
+
+            /*
+             * Handle peer shutdown only after processing
+             * any readable data delivered with the same
+             * epoll event.
+             */
+            if (event_flags & (EPOLLHUP | EPOLLRDHUP)) {
+                printf("Client disconnected. fd = %d\n", fd);
+
+                remove_client(epoll_fd, fd);
+                continue;
             }
         }
     }
