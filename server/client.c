@@ -3,8 +3,10 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <string.h>
 
 #include "client.h"
+#include "protocol.h"
 
 struct client_node {
     struct client client;
@@ -79,43 +81,130 @@ void client_remove(int fd)
 
 int client_handle_read(struct client *client)
 {
-    char buffer[1024];
-
     for (;;) {
+        size_t available;
         ssize_t received;
 
+        /*
+         * Calculate the remaining space in the
+         * client's receive buffer.
+         */
+        available = CLIENT_RX_BUFFER_SIZE - client->rx_len;
+
+        /*
+         * Append newly received bytes after the data
+         * already stored in the RX buffer.
+         */
         received = recv(client->fd,
-                        buffer,
-                        sizeof(buffer),
+                        client->rx_buffer + client->rx_len,
+                        available,
                         0);
 
         if (received > 0) {
+            client->rx_len += (size_t)received;
+
             /*
-             * Client data is intentionally discarded
-             * in this task.
-             *
-             * RX buffering and command parsing will
-             * be implemented in a later task.
+             * Process every complete newline-terminated
+             * command currently stored in the RX buffer.
              */
+            for (;;) {
+                char *newline;
+                char line[CLIENT_RX_BUFFER_SIZE];
+                size_t line_len;
+                size_t remaining;
+
+                /*
+                 * Search for the first complete command.
+                 */
+                newline = memchr(client->rx_buffer,
+                                 '\n',
+                                 client->rx_len);
+
+                /*
+                 * No complete command is available yet.
+                 * Preserve the partial data for the next recv().
+                 */
+                if (newline == NULL) {
+                    break;
+                }
+
+                /*
+                 * Calculate the command length without
+                 * including the newline character.
+                 */
+                line_len =
+                    (size_t)(newline - client->rx_buffer);
+
+                /*
+                 * Copy the complete command into a
+                 * null-terminated temporary string.
+                 */
+                memcpy(line,
+                    client->rx_buffer,
+                    line_len);
+
+                line[line_len] = '\0';
+
+                /*
+                * Pass the complete command line to the
+                * protocol layer for parsing.
+                */
+                {
+                    parsed_cmd_t cmd;
+
+                    (void)parse_command_line(line, &cmd);
+                }
+
+                remaining =
+                    client->rx_len - (line_len + 1);
+
+                memmove(client->rx_buffer,
+                        newline + 1,
+                        remaining);
+
+                client->rx_len = remaining;
+            }
+
+            /*
+             * If the RX buffer is completely full and
+             * no newline was found, the client exceeded
+             * the maximum allowed command size.
+             */
+            if (client->rx_len == CLIENT_RX_BUFFER_SIZE) {
+                errno = EMSGSIZE;
+                return -1;
+            }
+
             continue;
         }
 
+        /*
+         * recv() returning zero means that the peer
+         * closed the TCP connection.
+         */
         if (received == 0) {
-            /*
-             * recv() == 0 means the peer closed
-             * the TCP connection.
-             */
             return 1;
         }
 
+        /*
+         * Retry recv() if it was interrupted by a signal.
+         */
         if (errno == EINTR) {
             continue;
         }
 
+        /*
+         * No more data is currently available on the
+         * non-blocking socket.
+         */
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return 0;
         }
 
+        /*
+         * Any other recv() error is treated as a
+         * client read failure.
+         */
         return -1;
     }
 }
