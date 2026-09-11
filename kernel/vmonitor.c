@@ -28,11 +28,16 @@
 #include <linux/atomic.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/ktime.h>
 
 #include "vmonitor_uapi.h"
 
 #define DRIVER_NAME    "vmonitor"
 #define QUEUE_CAPACITY 64
+#define DEFAULT_THRESHOLD_MC 35000  /* used only to evaluate the alarm bit
+                                     * on injected samples; full sysfs
+                                     * configurability is a later task */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("staj");
@@ -54,7 +59,17 @@ struct vmonitor_dev {
     spinlock_t lock;              /* protects queue + counters below */
     struct vmonitor_queue queue;
 
+    struct mutex read_lock;       /* serializes the full peek->copy_to_user->
+                                    * advance sequence in read(), so two
+                                    * concurrent readers sharing the same fd
+                                    * (e.g. threads, or an fd inherited across
+                                    * fork()) cannot both act on the same
+                                    * queue head element */
+
     __u64 seq_counter;            /* next sequence number to assign */
+    s32 threshold_mC;             /* used to set the alarm bit on injected
+                                    * samples; sysfs configurability lands
+                                    * in a later task, hence the default */
 
     /* Queue-related counters (mirrors what GET_STATUS will expose later) */
     u64 produced_total;   /* samples created (write() calls that validated OK) */
@@ -158,11 +173,15 @@ static int vmonitor_release(struct inode *inode, struct file *filp)
  * is a later task). count must be exactly sizeof(struct vmonitor_sample);
  * anything else is -EINVAL.
  *
- * Note on the peek-then-advance gap: this is safe from a second concurrent
- * read() racing on the same head element because the driver's single-open
- * lock (see vmonitor_open()) guarantees only one process can have the
- * device open -- and therefore only one caller can be inside read() -- at
- * any given time.
+ * Concurrency note: the single-open guard in vmonitor_open() only prevents
+ * a SECOND open() call -- it does not prevent two threads (or a forked
+ * child) that share the same already-open file descriptor from both
+ * calling read() at once. Without further protection, two concurrent
+ * calls could each peek the same head element before either advances the
+ * queue, causing a duplicate delivery and a double queue_advance() (which
+ * could even underflow dev->queue.count). dev->read_lock, held for the
+ * entire peek -> copy_to_user -> advance sequence, serializes concurrent
+ * readers and closes that gap.
  */
 static ssize_t vmonitor_read(struct file *filp, char __user *buf,
                               size_t count, loff_t *ppos)
@@ -171,19 +190,27 @@ static ssize_t vmonitor_read(struct file *filp, char __user *buf,
     struct vmonitor_sample sample;
     unsigned long flags;
     bool available;
+    ssize_t ret;
 
     if (count != sizeof(sample))
         return -EINVAL;
+
+    if (mutex_lock_interruptible(&dev->read_lock))
+        return -ERESTARTSYS;
 
     spin_lock_irqsave(&dev->lock, flags);
     available = queue_peek(&dev->queue, &sample);
     spin_unlock_irqrestore(&dev->lock, flags);
 
-    if (!available)
-        return 0; /* queue empty */
+    if (!available) {
+        ret = 0; /* queue empty */
+        goto out_unlock;
+    }
 
-    if (copy_to_user(buf, &sample, sizeof(sample)))
-        return -EFAULT; /* sample stays in the queue, nothing was lost */
+    if (copy_to_user(buf, &sample, sizeof(sample))) {
+        ret = -EFAULT; /* sample stays in the queue, nothing was lost */
+        goto out_unlock;
+    }
 
     /* Only now, after the copy succeeded, actually remove it and count it. */
     spin_lock_irqsave(&dev->lock, flags);
@@ -191,14 +218,27 @@ static ssize_t vmonitor_read(struct file *filp, char __user *buf,
     dev->read_total++;
     spin_unlock_irqrestore(&dev->lock, flags);
 
-    return sizeof(sample);
+    ret = sizeof(sample);
+
+out_unlock:
+    mutex_unlock(&dev->read_lock);
+    return ret;
 }
 
 /*
- * write(): manual temperature injection. Userspace provides a
- * struct vmonitor_sample; the driver validates the size, copies it in,
- * assigns its own sequence number (userspace-provided seq is ignored),
- * and pushes it onto the queue.
+ * write(): manual temperature injection. Per the task's own description,
+ * userspace supplies ONLY the temperature to inject -- the driver is
+ * responsible for constructing the rest of the sample itself, the same
+ * way the (future) timer path will. Concretely:
+ *   - seq: assigned by the driver (monotonic counter)
+ *   - timestamp_ns: assigned by the driver (ktime_get_ns() at write time)
+ *   - alarm: evaluated by the driver against the current threshold
+ *   - value_mC: the one field userspace actually controls
+ *
+ * We still require the caller to send a full struct vmonitor_sample of
+ * the correct size (rather than just a bare integer) to keep the
+ * on-the-wire format uniform with read(), but everything except
+ * value_mC in what the caller sends is ignored/overwritten.
  */
 static ssize_t vmonitor_write(struct file *filp, const char __user *buf,
                                size_t count, loff_t *ppos)
@@ -216,10 +256,13 @@ static ssize_t vmonitor_write(struct file *filp, const char __user *buf,
     if (copy_from_user(&sample, buf, sizeof(sample)))
         return -EFAULT;
 
+    /* Driver-owned fields: only value_mC survives from what userspace sent. */
+    sample.timestamp_ns = ktime_get_ns();
+
     spin_lock_irqsave(&dev->lock, flags);
 
-    /* Driver owns the sequence number, not the caller */
     sample.seq = ++dev->seq_counter;
+    sample.alarm = (sample.value_mC >= dev->threshold_mC) ? 1 : 0;
     dev->produced_total++;
 
     pushed = queue_push(&dev->queue, &sample);
@@ -255,6 +298,8 @@ static int __init vmonitor_init(void)
 
     atomic_set(&vdev->opened, 0);
     spin_lock_init(&vdev->lock);
+    mutex_init(&vdev->read_lock);
+    vdev->threshold_mC = DEFAULT_THRESHOLD_MC;
 
     ret = alloc_chrdev_region(&vmonitor_devno, 0, 1, DRIVER_NAME);
     if (ret < 0) {
@@ -306,6 +351,7 @@ static void __exit vmonitor_exit(void)
     class_destroy(vmonitor_class);
     cdev_del(&vdev->cdev);
     unregister_chrdev_region(vmonitor_devno, 1);
+    mutex_destroy(&vdev->read_lock);
     kfree(vdev);
     pr_info(DRIVER_NAME ": kaldirildi\n");
 }
