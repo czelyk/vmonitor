@@ -9,17 +9,9 @@
 struct client {
     int fd;
 
-    /*
-     * Per-client receive buffer used to preserve
-     * partial TCP command data between recv() calls.
-     */
     char rx_buffer[CLIENT_RX_BUFFER_SIZE];
     size_t rx_len;
 
-    /*
-     * TX buffering and WATCH state are reserved
-     * for later tasks.
-     */
     char tx_buffer[CLIENT_TX_BUFFER_SIZE];
     size_t tx_len;
     size_t tx_sent;
@@ -32,6 +24,27 @@ void client_remove(int fd);
 struct client *client_find(int fd);
 
 int client_handle_read(struct client *client);
+
+/*
+ * Queue data for non-blocking transmission.
+ *
+ * Returns:
+ *   0  -> success
+ *  -1  -> error / TX buffer overflow
+ */
+int client_queue_tx(struct client *client,
+                    const void *data,
+                    size_t length);
+
+/*
+ * Try to flush pending TX data.
+ *
+ * Returns:
+ *   0  -> success or EAGAIN/EWOULDBLOCK
+ *  -1  -> fatal send error
+ */
 int client_handle_write(struct client *client);
+
+int client_has_pending_tx(const struct client *client);
 
 #endif
