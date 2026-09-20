@@ -14,15 +14,15 @@ struct client_node {
 };
 
 static struct client_node *client_list = NULL;
+static size_t active_client_count = 0;
 
 struct client *client_find(int fd)
 {
     struct client_node *node = client_list;
 
     while (node != NULL) {
-        if (node->client.fd == fd) {
+        if (node->client.fd == fd)
             return &node->client;
-        }
 
         node = node->next;
     }
@@ -30,53 +30,88 @@ struct client *client_find(int fd)
     return NULL;
 }
 
+size_t client_count(void)
+{
+    return active_client_count;
+}
+
+int client_limit_reached(void)
+{
+    return active_client_count >= CLIENT_MAX_COUNT;
+}
+
 int client_add(int fd)
 {
     struct client_node *node;
+
+    if (fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
 
     if (client_find(fd) != NULL) {
         errno = EEXIST;
         return -1;
     }
 
-    node = calloc(1, sizeof(*node));
-
-    if (node == NULL) {
+    if (client_limit_reached()) {
+        errno = ENOSPC;
         return -1;
     }
+
+    node = calloc(1, sizeof(*node));
+
+    if (node == NULL)
+        return -1;
 
     node->client.fd = fd;
 
     node->next = client_list;
     client_list = node;
 
+    active_client_count++;
+
     return 0;
 }
 
-void client_remove(int fd)
+int client_remove(int fd)
 {
     struct client_node *node = client_list;
     struct client_node *previous = NULL;
 
     while (node != NULL) {
-
         if (node->client.fd == fd) {
-
-            if (previous == NULL) {
+            if (previous == NULL)
                 client_list = node->next;
-            } else {
+            else
                 previous->next = node->next;
-            }
+
+            /*
+             * Unlink the node before closing/freeing it.
+             * This prevents a stale entry from remaining
+             * visible in the client list.
+             */
+            if (active_client_count > 0)
+                active_client_count--;
 
             close(node->client.fd);
             free(node);
 
-            return;
+            return 0;
         }
 
         previous = node;
         node = node->next;
     }
+
+    /*
+     * The client is already gone.
+     *
+     * Do not close(fd) here: the descriptor number may
+     * already have been reused for another resource.
+     */
+    errno = ENOENT;
+    return -1;
 }
 
 int client_handle_read(struct client *client)
@@ -90,11 +125,6 @@ int client_handle_read(struct client *client)
         size_t available;
         ssize_t received;
 
-        /*
-         * A completely full buffer with no complete
-         * command means the client exceeded the
-         * maximum command size.
-         */
         if (client->rx_len >= CLIENT_RX_BUFFER_SIZE) {
             errno = EMSGSIZE;
             return -1;
@@ -103,10 +133,6 @@ int client_handle_read(struct client *client)
         available =
             CLIENT_RX_BUFFER_SIZE - client->rx_len;
 
-        /*
-         * Append incoming bytes after any partial
-         * command already stored in the RX buffer.
-         */
         received = recv(client->fd,
                         client->rx_buffer + client->rx_len,
                         available,
@@ -115,10 +141,6 @@ int client_handle_read(struct client *client)
         if (received > 0) {
             client->rx_len += (size_t)received;
 
-            /*
-             * Process every complete newline-terminated
-             * command currently stored in the buffer.
-             */
             for (;;) {
                 char *newline;
                 char line[CLIENT_RX_BUFFER_SIZE];
@@ -130,13 +152,8 @@ int client_handle_read(struct client *client)
                                  '\n',
                                  client->rx_len);
 
-                /*
-                 * No full line yet.
-                 * Preserve partial command for the next recv().
-                 */
-                if (newline == NULL) {
+                if (newline == NULL)
                     break;
-                }
 
                 line_len =
                     (size_t)(newline - client->rx_buffer);
@@ -148,10 +165,10 @@ int client_handle_read(struct client *client)
                 line[line_len] = '\0';
 
                 /*
-                 * Pass complete command to protocol parser.
+                 * Parsing only.
                  *
-                 * Actual protocol command execution /
-                 * response generation is handled separately.
+                 * Protocol command execution remains outside
+                 * the scope of client lifecycle handling.
                  */
                 {
                     parsed_cmd_t cmd;
@@ -159,9 +176,6 @@ int client_handle_read(struct client *client)
                     (void)parse_command_line(line, &cmd);
                 }
 
-                /*
-                 * Remove processed command from RX buffer.
-                 */
                 remaining =
                     client->rx_len - (line_len + 1);
 
@@ -172,57 +186,35 @@ int client_handle_read(struct client *client)
                 client->rx_len = remaining;
             }
 
-            /*
-             * Buffer became full but still contains no
-             * complete newline-terminated command.
-             */
             if (client->rx_len == CLIENT_RX_BUFFER_SIZE) {
                 errno = EMSGSIZE;
                 return -1;
             }
 
-            /*
-             * Continue recv() until the non-blocking
-             * socket reports EAGAIN/EWOULDBLOCK.
-             */
             continue;
         }
 
         /*
-         * Peer performed an orderly shutdown.
+         * Orderly peer shutdown.
          */
-        if (received == 0) {
+        if (received == 0)
             return 1;
-        }
 
-        /*
-         * Interrupted system call: retry.
-         */
-        if (errno == EINTR) {
+        if (errno == EINTR)
             continue;
-        }
 
-        /*
-         * No more data available for now.
-         */
         if (errno == EAGAIN ||
-            errno == EWOULDBLOCK) {
-
+            errno == EWOULDBLOCK)
             return 0;
-        }
 
-        /*
-         * Fatal recv() error.
-         */
         return -1;
     }
 }
 
 int client_has_pending_tx(const struct client *client)
 {
-    if (client == NULL) {
+    if (client == NULL)
         return 0;
-    }
 
     return client->tx_sent < client->tx_len;
 }
@@ -240,13 +232,9 @@ int client_queue_tx(struct client *client,
         return -1;
     }
 
-    if (length == 0) {
+    if (length == 0)
         return 0;
-    }
 
-    /*
-     * Validate TX state before using it.
-     */
     if (client->tx_sent > client->tx_len ||
         client->tx_len > CLIENT_TX_BUFFER_SIZE) {
 
@@ -260,7 +248,8 @@ int client_queue_tx(struct client *client,
     /*
      * Slow-client policy:
      *
-     * Never allow more than 64 KiB of pending output.
+     * Never allow more than CLIENT_TX_BUFFER_SIZE
+     * bytes of pending output.
      */
     if (length >
         CLIENT_TX_BUFFER_SIZE - pending) {
@@ -270,11 +259,9 @@ int client_queue_tx(struct client *client,
     }
 
     /*
-     * Reclaim space occupied by bytes that have
-     * already been sent.
+     * Reclaim already-sent space before appending.
      */
     if (client->tx_sent > 0) {
-
         memmove(client->tx_buffer,
                 client->tx_buffer + client->tx_sent,
                 pending);
@@ -283,9 +270,6 @@ int client_queue_tx(struct client *client,
         client->tx_sent = 0;
     }
 
-    /*
-     * Append new data to the pending TX queue.
-     */
     memcpy(client->tx_buffer + client->tx_len,
            data,
            length);
@@ -309,9 +293,6 @@ int client_handle_write(struct client *client)
         return -1;
     }
 
-    /*
-     * Try to flush as much pending data as possible.
-     */
     while (client->tx_sent < client->tx_len) {
         ssize_t sent;
 
@@ -330,32 +311,19 @@ int client_handle_write(struct client *client)
             return -1;
         }
 
-        if (errno == EINTR) {
+        if (errno == EINTR)
             continue;
-        }
 
-        /*
-         * Healthy non-blocking socket, but its send
-         * buffer is currently full.
-         *
-         * Keep unsent bytes queued and wait for
-         * another EPOLLOUT notification.
-         */
         if (errno == EAGAIN ||
-            errno == EWOULDBLOCK) {
-
+            errno == EWOULDBLOCK)
             return 0;
-        }
 
         /*
-         * Fatal send() error.
+         * Fatal send error.
          */
         return -1;
     }
 
-    /*
-     * All queued bytes have been transmitted.
-     */
     client->tx_len = 0;
     client->tx_sent = 0;
 
