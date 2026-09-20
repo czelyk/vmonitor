@@ -14,53 +14,60 @@
 
 #define MAX_EVENTS 64
 
-/*
- * Set a file descriptor to non-blocking mode.
- */
 static int set_nonblocking(int fd)
 {
     int flags;
 
     flags = fcntl(fd, F_GETFL, 0);
 
-    if (flags < 0) {
+    if (flags < 0)
         return -1;
-    }
 
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
         return -1;
-    }
 
     return 0;
 }
 
 /*
- * Remove a client from epoll and destroy
- * its per-client state.
+ * Single cleanup path for registered clients.
+ *
+ * Remove from epoll first, then remove client state.
+ * client_remove() owns closing the client socket.
  */
 static void remove_client(int epoll_fd, int client_fd)
 {
+    /*
+     * First verify that this descriptor still belongs
+     * to a tracked client.
+     *
+     * This makes repeated cleanup attempts harmless.
+     */
+    if (client_find(client_fd) == NULL)
+        return;
+
     if (epoll_ctl(epoll_fd,
                   EPOLL_CTL_DEL,
                   client_fd,
                   NULL) < 0) {
 
-        if (errno != ENOENT) {
+        /*
+         * ENOENT means it is already absent from epoll.
+         * Cleanup of our own client state must still occur.
+         */
+        if (errno != ENOENT &&
+            errno != EBADF) {
+
             perror("epoll_ctl(DEL client)");
         }
     }
 
-    client_remove(client_fd);
+    if (client_remove(client_fd) < 0) {
+        if (errno != ENOENT)
+            perror("client_remove");
+    }
 }
 
-/*
- * Update the events monitored for a client.
- *
- * EPOLLIN and EPOLLRDHUP are always enabled.
- *
- * EPOLLOUT is enabled only while the client
- * has unsent data in its TX buffer.
- */
 static int update_client_events(int epoll_fd,
                                 struct client *client)
 {
@@ -75,9 +82,8 @@ static int update_client_events(int epoll_fd,
 
     event.events = EPOLLIN | EPOLLRDHUP;
 
-    if (client_has_pending_tx(client)) {
+    if (client_has_pending_tx(client))
         event.events |= EPOLLOUT;
-    }
 
     event.data.fd = client->fd;
 
@@ -92,20 +98,12 @@ static int update_client_events(int epoll_fd,
     return 0;
 }
 
-/*
- * Accept every currently pending TCP connection.
- *
- * The listening socket is non-blocking, so accept()
- * eventually returns EAGAIN/EWOULDBLOCK when the
- * accept queue has been drained.
- */
 static int accept_clients(int epoll_fd, int server_fd)
 {
     for (;;) {
         struct sockaddr_in client_addr;
         socklen_t client_addr_len;
         struct epoll_event event;
-
         int client_fd;
 
         client_addr_len = sizeof(client_addr);
@@ -115,52 +113,54 @@ static int accept_clients(int epoll_fd, int server_fd)
                            &client_addr_len);
 
         if (client_fd < 0) {
-
-            /*
-             * No more pending clients.
-             */
             if (errno == EAGAIN ||
                 errno == EWOULDBLOCK) {
 
                 return 0;
             }
 
-            /*
-             * Retry interrupted accept().
-             */
-            if (errno == EINTR) {
+            if (errno == EINTR)
                 continue;
-            }
 
             perror("accept");
             return -1;
         }
 
         /*
-         * Every accepted client socket must also
-         * operate in non-blocking mode.
+         * Enforce the connection limit immediately after
+         * accept(). The accepted socket is not inserted
+         * into either the client list or epoll.
          */
+        if (client_limit_reached()) {
+            fprintf(stderr,
+                    "Client limit reached (%d). "
+                    "Rejecting fd = %d\n",
+                    CLIENT_MAX_COUNT,
+                    client_fd);
+
+            close(client_fd);
+            continue;
+        }
+
         if (set_nonblocking(client_fd) < 0) {
             perror("fcntl(client_fd)");
             close(client_fd);
             continue;
         }
 
-        /*
-         * Create the per-client state.
-         */
         if (client_add(client_fd) < 0) {
             perror("client_add");
+
+            /*
+             * client_add() has not taken ownership when
+             * it returns an error.
+             */
             close(client_fd);
             continue;
         }
 
         memset(&event, 0, sizeof(event));
 
-        /*
-         * Initially there is no pending TX data,
-         * therefore EPOLLOUT is not enabled.
-         */
         event.events = EPOLLIN | EPOLLRDHUP;
         event.data.fd = client_fd;
 
@@ -170,18 +170,25 @@ static int accept_clients(int epoll_fd, int server_fd)
                       &event) < 0) {
 
             perror("epoll_ctl(ADD client)");
-            client_remove(client_fd);
+
+            /*
+             * client_add() succeeded, so client_remove()
+             * now owns closing the socket.
+             *
+             * No EPOLL_CTL_DEL is needed because ADD failed.
+             */
+            (void)client_remove(client_fd);
             continue;
         }
 
-        printf("Client connected. fd = %d\n",
-               client_fd);
+        printf("Client connected. fd = %d "
+               "active = %zu/%d\n",
+               client_fd,
+               client_count(),
+               CLIENT_MAX_COUNT);
     }
 }
 
-/*
- * Main server event loop.
- */
 int event_loop_run(int server_fd)
 {
     struct epoll_event event;
@@ -189,9 +196,6 @@ int event_loop_run(int server_fd)
 
     int epoll_fd;
 
-    /*
-     * Create epoll instance.
-     */
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
 
     if (epoll_fd < 0) {
@@ -199,9 +203,6 @@ int event_loop_run(int server_fd)
         return -1;
     }
 
-    /*
-     * Register listening socket.
-     */
     memset(&event, 0, sizeof(event));
 
     event.events = EPOLLIN;
@@ -217,7 +218,9 @@ int event_loop_run(int server_fd)
         return -1;
     }
 
-    printf("Epoll event loop started\n");
+    printf("Epoll event loop started. "
+           "Maximum clients = %d\n",
+           CLIENT_MAX_COUNT);
 
     for (;;) {
         int ready;
@@ -229,10 +232,8 @@ int event_loop_run(int server_fd)
                            -1);
 
         if (ready < 0) {
-
-            if (errno == EINTR) {
+            if (errno == EINTR)
                 continue;
-            }
 
             perror("epoll_wait");
             close(epoll_fd);
@@ -247,10 +248,9 @@ int event_loop_run(int server_fd)
             event_flags = events[i].events;
 
             /*
-             * Listening socket event.
+             * Listening socket.
              */
             if (fd == server_fd) {
-
                 if (event_flags &
                     (EPOLLERR | EPOLLHUP)) {
 
@@ -262,16 +262,12 @@ int event_loop_run(int server_fd)
                 }
 
                 if (event_flags & EPOLLIN) {
-
-                    /*
-                     * Accept all pending connections.
-                     */
                     if (accept_clients(epoll_fd,
                                        server_fd) < 0) {
 
                         /*
-                         * Keep server alive even if one
-                         * accept cycle fails.
+                         * Keep the server alive after an
+                         * isolated accept failure.
                          */
                         continue;
                     }
@@ -281,28 +277,29 @@ int event_loop_run(int server_fd)
             }
 
             /*
-             * From here onward this event belongs
-             * to a connected client.
+             * Ignore stale epoll events for a client that
+             * was already removed earlier in this batch.
              */
+            if (client_find(fd) == NULL)
+                continue;
 
             /*
-             * Fatal socket error.
+             * EPOLLERR represents a fatal socket error.
              */
             if (event_flags & EPOLLERR) {
-                printf("Client error. fd = %d\n",
-                       fd);
+                fprintf(stderr,
+                        "Client socket error. fd = %d\n",
+                        fd);
 
                 remove_client(epoll_fd, fd);
                 continue;
             }
 
             /*
-             * Read incoming TCP data first.
+             * Process readable bytes before RDHUP/HUP.
              *
-             * This must happen before handling
-             * EPOLLRDHUP / EPOLLHUP because readable
-             * data and peer shutdown can be reported
-             * in the same epoll event.
+             * epoll may report readable data and peer
+             * shutdown in the same event.
              */
             if (event_flags & EPOLLIN) {
                 struct client *client;
@@ -310,44 +307,30 @@ int event_loop_run(int server_fd)
 
                 client = client_find(fd);
 
-                if (client == NULL) {
-                    fprintf(stderr,
-                            "Unknown client fd = %d\n",
-                            fd);
-
-                    remove_client(epoll_fd, fd);
+                if (client == NULL)
                     continue;
-                }
 
                 result = client_handle_read(client);
 
-                /*
-                 * recv() returned 0.
-                 */
                 if (result > 0) {
-                    printf("Client disconnected. fd = %d\n",
+                    printf("Client closed connection. "
+                           "fd = %d\n",
                            fd);
 
                     remove_client(epoll_fd, fd);
                     continue;
                 }
 
-                /*
-                 * Fatal receive error or oversized
-                 * incoming command.
-                 */
                 if (result < 0) {
-                    perror("recv");
+                    perror("client recv");
 
                     remove_client(epoll_fd, fd);
                     continue;
                 }
 
                 /*
-                 * Reading/parsing the command may have
-                 * queued response data.
-                 *
-                 * Enable EPOLLOUT if TX data is pending.
+                 * Protocol handling may eventually queue
+                 * TX data while processing input.
                  */
                 if (update_client_events(epoll_fd,
                                          client) < 0) {
@@ -360,45 +343,30 @@ int event_loop_run(int server_fd)
             }
 
             /*
-             * Socket is currently writable.
-             *
-             * Flush as much pending TX data as possible.
+             * The client might have been removed while
+             * handling EPOLLIN.
              */
+            if (client_find(fd) == NULL)
+                continue;
+
             if (event_flags & EPOLLOUT) {
                 struct client *client;
                 int result;
 
                 client = client_find(fd);
 
-                if (client == NULL) {
-                    fprintf(stderr,
-                            "Unknown client fd = %d\n",
-                            fd);
-
-                    remove_client(epoll_fd, fd);
+                if (client == NULL)
                     continue;
-                }
 
                 result = client_handle_write(client);
 
-                /*
-                 * Fatal send error.
-                 */
                 if (result < 0) {
-                    perror("send");
+                    perror("client send");
 
                     remove_client(epoll_fd, fd);
                     continue;
                 }
 
-                /*
-                 * If all bytes were sent,
-                 * client_has_pending_tx() becomes false
-                 * and EPOLLOUT is removed.
-                 *
-                 * If send() reached EAGAIN, pending
-                 * bytes remain and EPOLLOUT stays active.
-                 */
                 if (update_client_events(epoll_fd,
                                          client) < 0) {
 
@@ -410,13 +378,19 @@ int event_loop_run(int server_fd)
             }
 
             /*
-             * Handle peer shutdown only after pending
-             * readable/writable work has been processed.
+             * EPOLLIN/EPOLLOUT may have removed the client.
+             */
+            if (client_find(fd) == NULL)
+                continue;
+
+            /*
+             * Handle peer shutdown after processing readable
+             * data that arrived with the same event.
              */
             if (event_flags &
-                (EPOLLHUP | EPOLLRDHUP)) {
+                (EPOLLRDHUP | EPOLLHUP)) {
 
-                printf("Client disconnected. fd = %d\n",
+                printf("Client hangup. fd = %d\n",
                        fd);
 
                 remove_client(epoll_fd, fd);
