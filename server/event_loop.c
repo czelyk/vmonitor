@@ -112,7 +112,6 @@ static int accept_clients(int epoll_fd,
         struct sockaddr_in client_addr;
         socklen_t client_addr_len;
         struct epoll_event event;
-
         int client_fd;
 
         client_addr_len =
@@ -124,6 +123,8 @@ static int accept_clients(int epoll_fd,
                    &client_addr_len);
 
         if (client_fd < 0) {
+            if (errno == EAGAIN ||
+                errno == EWOULDBLOCK) {
 
             if (errno == EAGAIN ||
                 errno == EWOULDBLOCK) {
@@ -441,6 +442,8 @@ int event_loop_run(int server_fd,
              * -------------------------------------------------
              */
             if (fd == server_fd) {
+                if (event_flags &
+                    (EPOLLERR | EPOLLHUP)) {
 
                 if (event_flags &
                     (EPOLLERR |
@@ -617,6 +620,25 @@ int event_loop_run(int server_fd,
 
                     continue;
                 }
+            }
+
+            /*
+             * The client might have been removed while
+             * handling EPOLLIN.
+             */
+            if (client_find(fd) == NULL)
+                continue;
+
+            if (event_flags & EPOLLOUT) {
+                struct client *client;
+                int result;
+
+                client = client_find(fd);
+
+                if (client == NULL)
+                    continue;
+
+                result = client_handle_write(client);
 
                 if (result < 0) {
 

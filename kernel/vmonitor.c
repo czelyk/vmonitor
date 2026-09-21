@@ -1,151 +1,637 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * vmonitor.c - Basic character device infrastructure
- *
- * Scope of this task (feature/kernel-driver):
- *   - Register the device with alloc_chrdev_region()
- *   - Initialize cdev with cdev_init()
- *   - Register it with cdev_add()
- *   - Implement open() / release()
- *   - Allow only one process to open the device at a time (-EBUSY otherwise)
- *   - Clean up all allocated resources on module exit
- *
- * Explicitly NOT implemented here (future tasks):
- *   - Sample queue
- *   - Timer-driven data generation
- *   - ioctl
- *   - sysfs attributes
- *   - poll
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
-#include <linux/atomic.h>
+#include <linux/uaccess.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/atomic.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/ktime.h>
+#include <linux/wait.h>
+#include <linux/poll.h>
+#include <linux/version.h>
+#include <linux/ioctl.h>
 
-#define DRIVER_NAME "vmonitor"
+#include "../include/vmonitor_uapi.h"
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("staj");
-MODULE_DESCRIPTION("Virtual temperature monitor - basic character device infrastructure");
+#define DEVICE_NAME "vmonitor"
+#define CLASS_NAME  "vmonitor"
 
-/* Aygit durumu: bu asamada sadece cdev ve tekli-erisim kilidi tutuluyor. */
-struct vmonitor_dev {
+#define VMONITOR_QUEUE_CAPACITY 64
+
+#define VMONITOR_DEFAULT_PERIOD_MS     1000U
+#define VMONITOR_DEFAULT_THRESHOLD_MC 35000
+
+#define VMONITOR_TEMP_MIN_MC  20000
+#define VMONITOR_TEMP_MAX_MC  40000
+#define VMONITOR_TEMP_STEP_MC 1000
+
+struct vmonitor_device {
+    dev_t devno;
     struct cdev cdev;
-    atomic_t opened; /* 0 = kapali, 1 = acik -> tekli erisim kilidi */
+    struct class *class;
+    struct device *device;
+
+    atomic_t opened;
+
+    spinlock_t lock;
+    struct mutex read_lock;
+    struct mutex control_lock;
+
+    wait_queue_head_t read_wait;
+
+    struct timer_list timer;
+
+    struct vmonitor_sample queue[VMONITOR_QUEUE_CAPACITY];
+    unsigned int q_head;
+    unsigned int q_tail;
+    unsigned int q_count;
+
+    bool running;
+    u32 period_ms;
+    s32 threshold_mC;
+
+    s32 next_value_mC;
+
+    u64 next_seq;
+
+    u64 produced_total;
+    u64 enqueued_total;
+    u64 dropped_total;
+    u64 read_total;
+
+    u64 last_seq;
+    s32 last_value_mC;
+    u32 last_alarm;
 };
 
-static struct vmonitor_dev *vdev;
-static dev_t vmonitor_devno;
-static struct class *vmonitor_class;
-static struct device *vmonitor_device;
+static struct vmonitor_device vmon;
 
 /*
- * open(): Ayni anda sadece bir process cihazi acabilir.
- * atomic_cmpxchg(&opened, 0, 1): deger 0 ise 1 yap ve ESKI degeri dondur.
- * Eski deger 0 degilse (yani zaten 1 ise) baskasi acik demektir -> EBUSY.
+ * Must be called with vmon.lock held.
+ *
+ * The function creates a new sample, updates global statistics and
+ * attempts to enqueue the sample.
+ *
+ * Queue policy:
+ *     DROP NEW
+ *
+ * If the queue is full, unread samples already present in the queue
+ * are preserved and the newly produced sample is discarded.
  */
-static int vmonitor_open(struct inode *inode, struct file *filp)
+static bool vmonitor_produce_sample_locked(s32 value_mC)
 {
-    if (atomic_cmpxchg(&vdev->opened, 0, 1) != 0) {
-        pr_info(DRIVER_NAME ": open reddedildi, cihaz zaten acik (EBUSY)\n");
-        return -EBUSY;
+    struct vmonitor_sample sample;
+
+    sample.seq = vmon.next_seq++;
+    sample.timestamp_ns = ktime_get_ns();
+    sample.value_mC = value_mC;
+    sample.alarm = (value_mC >= vmon.threshold_mC) ? 1U : 0U;
+
+    vmon.produced_total++;
+
+    vmon.last_seq = sample.seq;
+    vmon.last_value_mC = sample.value_mC;
+    vmon.last_alarm = sample.alarm;
+
+    if (vmon.q_count == VMONITOR_QUEUE_CAPACITY) {
+        vmon.dropped_total++;
+        return false;
     }
 
-    filp->private_data = vdev;
-    pr_info(DRIVER_NAME ": acildi\n");
+    vmon.queue[vmon.q_tail] = sample;
+
+    vmon.q_tail++;
+    if (vmon.q_tail == VMONITOR_QUEUE_CAPACITY)
+        vmon.q_tail = 0;
+
+    vmon.q_count++;
+    vmon.enqueued_total++;
+
+    return true;
+}
+
+static void vmonitor_timer_callback(struct timer_list *timer)
+{
+    unsigned long flags;
+    bool enqueued = false;
+
+    (void)timer;
+
+    spin_lock_irqsave(&vmon.lock, flags);
+
+    if (!vmon.running) {
+        spin_unlock_irqrestore(&vmon.lock, flags);
+        return;
+    }
+
+    enqueued = vmonitor_produce_sample_locked(vmon.next_value_mC);
+
+    vmon.next_value_mC += VMONITOR_TEMP_STEP_MC;
+
+    if (vmon.next_value_mC > VMONITOR_TEMP_MAX_MC)
+        vmon.next_value_mC = VMONITOR_TEMP_MIN_MC;
+
+    /*
+     * mod_timer() is safe from timer/atomic context.
+     *
+     * Rearming while holding the same state lock also serializes this
+     * operation with period_ms updates.
+     */
+    mod_timer(&vmon.timer,
+              jiffies + msecs_to_jiffies(vmon.period_ms));
+
+    spin_unlock_irqrestore(&vmon.lock, flags);
+
+    if (enqueued)
+        wake_up_interruptible(&vmon.read_wait);
+}
+
+static int vmonitor_open(struct inode *inode, struct file *file)
+{
+    (void)inode;
+
+    if (atomic_cmpxchg(&vmon.opened, 0, 1) != 0)
+        return -EBUSY;
+
+    file->private_data = &vmon;
+
     return 0;
 }
 
-/*
- * release(): Kilidi serbest birakir, boylece bir sonraki open() basarili olur.
- */
-static int vmonitor_release(struct inode *inode, struct file *filp)
+static int vmonitor_release(struct inode *inode, struct file *file)
 {
-    atomic_set(&vdev->opened, 0);
-    pr_info(DRIVER_NAME ": kapatildi\n");
+    (void)inode;
+    (void)file;
+
+    atomic_set(&vmon.opened, 0);
+
     return 0;
 }
+
+static ssize_t vmonitor_read(struct file *file,
+                             char __user *buf,
+                             size_t count,
+                             loff_t *ppos)
+{
+    struct vmonitor_sample sample;
+    unsigned long flags;
+    int ret;
+
+    (void)ppos;
+
+    if (count != sizeof(struct vmonitor_sample))
+        return -EINVAL;
+
+    /*
+     * Serialize readers so a sample is not removed from the queue until
+     * copy_to_user() has succeeded.
+     */
+    ret = mutex_lock_interruptible(&vmon.read_lock);
+    if (ret)
+        return ret;
+
+    for (;;) {
+        spin_lock_irqsave(&vmon.lock, flags);
+
+        if (vmon.q_count != 0) {
+            sample = vmon.queue[vmon.q_head];
+
+            spin_unlock_irqrestore(&vmon.lock, flags);
+            break;
+        }
+
+        spin_unlock_irqrestore(&vmon.lock, flags);
+
+        if (file->f_flags & O_NONBLOCK) {
+            mutex_unlock(&vmon.read_lock);
+            return -EAGAIN;
+        }
+
+        ret = wait_event_interruptible(
+            vmon.read_wait,
+            READ_ONCE(vmon.q_count) != 0
+        );
+
+        if (ret) {
+            mutex_unlock(&vmon.read_lock);
+            return ret;
+        }
+    }
+
+    if (copy_to_user(buf, &sample, sizeof(sample))) {
+        mutex_unlock(&vmon.read_lock);
+        return -EFAULT;
+    }
+
+    /*
+     * Advance the queue only after the sample has successfully reached
+     * userspace.
+     */
+    spin_lock_irqsave(&vmon.lock, flags);
+
+    vmon.q_head++;
+    if (vmon.q_head == VMONITOR_QUEUE_CAPACITY)
+        vmon.q_head = 0;
+
+    vmon.q_count--;
+    vmon.read_total++;
+
+    spin_unlock_irqrestore(&vmon.lock, flags);
+
+    mutex_unlock(&vmon.read_lock);
+
+    return sizeof(sample);
+}
+
+static ssize_t vmonitor_write(struct file *file,
+                              const char __user *buf,
+                              size_t count,
+                              loff_t *ppos)
+{
+    struct vmonitor_sample user_sample;
+    unsigned long flags;
+    bool enqueued;
+
+    (void)file;
+    (void)ppos;
+
+    if (count != sizeof(struct vmonitor_sample))
+        return -EINVAL;
+
+    if (copy_from_user(&user_sample, buf, sizeof(user_sample)))
+        return -EFAULT;
+
+    /*
+     * Userspace supplies the requested temperature value.
+     *
+     * seq, timestamp_ns and alarm are generated by the kernel so all
+     * samples obey the same ordering and alarm rules.
+     */
+    spin_lock_irqsave(&vmon.lock, flags);
+
+    enqueued = vmonitor_produce_sample_locked(user_sample.value_mC);
+
+    spin_unlock_irqrestore(&vmon.lock, flags);
+
+    if (enqueued)
+        wake_up_interruptible(&vmon.read_wait);
+
+    return sizeof(user_sample);
+}
+
+static long vmonitor_ioctl(struct file *file,
+                           unsigned int cmd,
+                           unsigned long arg)
+{
+    struct vmonitor_status status;
+    unsigned long flags;
+
+    (void)file;
+
+    switch (cmd) {
+    case VMONITOR_IOC_START:
+        mutex_lock(&vmon.control_lock);
+
+        spin_lock_irqsave(&vmon.lock, flags);
+
+        if (!vmon.running) {
+            vmon.running = true;
+
+            mod_timer(&vmon.timer,
+                      jiffies + msecs_to_jiffies(vmon.period_ms));
+        }
+
+        spin_unlock_irqrestore(&vmon.lock, flags);
+
+        mutex_unlock(&vmon.control_lock);
+
+        return 0;
+
+    case VMONITOR_IOC_STOP:
+        mutex_lock(&vmon.control_lock);
+
+        spin_lock_irqsave(&vmon.lock, flags);
+        vmon.running = false;
+        spin_unlock_irqrestore(&vmon.lock, flags);
+
+        /*
+         * Never call del_timer_sync() while holding vmon.lock because
+         * the timer callback also acquires that lock.
+         */
+        del_timer_sync(&vmon.timer);
+
+        mutex_unlock(&vmon.control_lock);
+
+        return 0;
+
+    case VMONITOR_IOC_GET_STATUS:
+        memset(&status, 0, sizeof(status));
+
+        spin_lock_irqsave(&vmon.lock, flags);
+
+        status.running = vmon.running ? 1U : 0U;
+        status.period_ms = vmon.period_ms;
+        status.threshold_mC = vmon.threshold_mC;
+
+        status.produced_total = vmon.produced_total;
+        status.enqueued_total = vmon.enqueued_total;
+        status.dropped_total = vmon.dropped_total;
+        status.read_total = vmon.read_total;
+
+        status.queued = vmon.q_count;
+
+        status.last_seq = vmon.last_seq;
+        status.last_value_mC = vmon.last_value_mC;
+        status.last_alarm = vmon.last_alarm;
+
+        spin_unlock_irqrestore(&vmon.lock, flags);
+
+        if (copy_to_user((void __user *)arg,
+                         &status,
+                         sizeof(status)))
+            return -EFAULT;
+
+        return 0;
+
+    default:
+        return -ENOTTY;
+    }
+}
+
+static __poll_t vmonitor_poll(struct file *file, poll_table *wait)
+{
+    __poll_t mask = 0;
+    unsigned long flags;
+
+    poll_wait(file, &vmon.read_wait, wait);
+
+    spin_lock_irqsave(&vmon.lock, flags);
+
+    if (vmon.q_count != 0)
+        mask |= EPOLLIN | EPOLLRDNORM;
+
+    spin_unlock_irqrestore(&vmon.lock, flags);
+
+    return mask;
+}
+
+/* ------------------------------------------------------------------------- */
+/* sysfs: period_ms                                                          */
+/* ------------------------------------------------------------------------- */
+
+static ssize_t period_ms_show(struct device *dev,
+                              struct device_attribute *attr,
+                              char *buf)
+{
+    unsigned long flags;
+    u32 period;
+
+    (void)dev;
+    (void)attr;
+
+    spin_lock_irqsave(&vmon.lock, flags);
+    period = vmon.period_ms;
+    spin_unlock_irqrestore(&vmon.lock, flags);
+
+    return sysfs_emit(buf, "%u\n", period);
+}
+
+static ssize_t period_ms_store(struct device *dev,
+                               struct device_attribute *attr,
+                               const char *buf,
+                               size_t count)
+{
+    unsigned long flags;
+    u32 period;
+    int ret;
+
+    (void)dev;
+    (void)attr;
+
+    ret = kstrtou32(buf, 0, &period);
+    if (ret)
+        return ret;
+
+    if (period == 0)
+        return -EINVAL;
+
+    mutex_lock(&vmon.control_lock);
+
+    spin_lock_irqsave(&vmon.lock, flags);
+
+    vmon.period_ms = period;
+
+    /*
+     * Changing period_ms while stopped must not start the generator.
+     * If running, update the next timer expiration immediately.
+     */
+    if (vmon.running) {
+        mod_timer(&vmon.timer,
+                  jiffies + msecs_to_jiffies(vmon.period_ms));
+    }
+
+    spin_unlock_irqrestore(&vmon.lock, flags);
+
+    mutex_unlock(&vmon.control_lock);
+
+    return count;
+}
+
+static DEVICE_ATTR_RW(period_ms);
+
+/* ------------------------------------------------------------------------- */
+/* sysfs: threshold_mC                                                       */
+/* ------------------------------------------------------------------------- */
+
+static ssize_t threshold_mC_show(struct device *dev,
+                                 struct device_attribute *attr,
+                                 char *buf)
+{
+    unsigned long flags;
+    s32 threshold;
+
+    (void)dev;
+    (void)attr;
+
+    spin_lock_irqsave(&vmon.lock, flags);
+    threshold = vmon.threshold_mC;
+    spin_unlock_irqrestore(&vmon.lock, flags);
+
+    return sysfs_emit(buf, "%d\n", threshold);
+}
+
+static ssize_t threshold_mC_store(struct device *dev,
+                                  struct device_attribute *attr,
+                                  const char *buf,
+                                  size_t count)
+{
+    unsigned long flags;
+    int threshold;
+    int ret;
+
+    (void)dev;
+    (void)attr;
+
+    ret = kstrtoint(buf, 0, &threshold);
+    if (ret)
+        return ret;
+
+    spin_lock_irqsave(&vmon.lock, flags);
+    vmon.threshold_mC = (s32)threshold;
+    spin_unlock_irqrestore(&vmon.lock, flags);
+
+    return count;
+}
+
+static DEVICE_ATTR_RW(threshold_mC);
+
+static struct attribute *vmonitor_attrs[] = {
+    &dev_attr_period_ms.attr,
+    &dev_attr_threshold_mC.attr,
+    NULL
+};
+
+static const struct attribute_group vmonitor_attr_group = {
+    .attrs = vmonitor_attrs,
+};
+
+/* ------------------------------------------------------------------------- */
 
 static const struct file_operations vmonitor_fops = {
-    .owner   = THIS_MODULE,
-    .open    = vmonitor_open,
-    .release = vmonitor_release,
-    /* read/write/unlocked_ioctl/poll: sonraki gorevlerde eklenecek */
+    .owner          = THIS_MODULE,
+    .open           = vmonitor_open,
+    .release        = vmonitor_release,
+    .read           = vmonitor_read,
+    .write          = vmonitor_write,
+    .unlocked_ioctl = vmonitor_ioctl,
+    .poll           = vmonitor_poll,
+    .llseek         = no_llseek,
 };
 
 static int __init vmonitor_init(void)
 {
     int ret;
 
-    vdev = kzalloc(sizeof(*vdev), GFP_KERNEL);
-    if (!vdev)
-        return -ENOMEM;
+    memset(&vmon, 0, sizeof(vmon));
 
-    atomic_set(&vdev->opened, 0);
+    atomic_set(&vmon.opened, 0);
 
-    /* 1) Major/minor numara aralilgini dinamik olarak ayir */
-    ret = alloc_chrdev_region(&vmonitor_devno, 0, 1, DRIVER_NAME);
-    if (ret < 0) {
-        pr_err(DRIVER_NAME ": alloc_chrdev_region basarisiz\n");
-        goto err_free_dev;
-    }
+    spin_lock_init(&vmon.lock);
+    mutex_init(&vmon.read_lock);
+    mutex_init(&vmon.control_lock);
 
-    /* 2) cdev yapisini file_operations ile ilişkilendir */
-    cdev_init(&vdev->cdev, &vmonitor_fops);
-    vdev->cdev.owner = THIS_MODULE;
+    init_waitqueue_head(&vmon.read_wait);
 
-    /* 3) cdev'i kernel'e kaydet */
-    ret = cdev_add(&vdev->cdev, vmonitor_devno, 1);
-    if (ret < 0) {
-        pr_err(DRIVER_NAME ": cdev_add basarisiz\n");
+    vmon.running = true;
+    vmon.period_ms = VMONITOR_DEFAULT_PERIOD_MS;
+    vmon.threshold_mC = VMONITOR_DEFAULT_THRESHOLD_MC;
+
+    vmon.next_value_mC = VMONITOR_TEMP_MIN_MC;
+    vmon.next_seq = 1;
+
+    timer_setup(&vmon.timer, vmonitor_timer_callback, 0);
+
+    ret = alloc_chrdev_region(&vmon.devno, 0, 1, DEVICE_NAME);
+    if (ret)
+        return ret;
+
+    cdev_init(&vmon.cdev, &vmonitor_fops);
+    vmon.cdev.owner = THIS_MODULE;
+
+    ret = cdev_add(&vmon.cdev, vmon.devno, 1);
+    if (ret)
         goto err_unregister;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    vmon.class = class_create(CLASS_NAME);
+#else
+    vmon.class = class_create(THIS_MODULE, CLASS_NAME);
+#endif
+
+    if (IS_ERR(vmon.class)) {
+        ret = PTR_ERR(vmon.class);
+        vmon.class = NULL;
+        goto err_cdev;
     }
 
-    /* /dev/vmonitor dugumunun otomatik olusmasi icin class + device.
-     * (Bu, gorev listesinde ayri bir madde olarak sayilmadi ama open()/EBUSY
-     * davranisini elle test edebilmek icin /dev/vmonitor dugumu gerekiyor.) */
-    vmonitor_class = class_create(DRIVER_NAME);
-    if (IS_ERR(vmonitor_class)) {
-        ret = PTR_ERR(vmonitor_class);
-        pr_err(DRIVER_NAME ": class_create basarisiz\n");
-        goto err_cdev_del;
+    vmon.device = device_create(vmon.class,
+                                NULL,
+                                vmon.devno,
+                                NULL,
+                                DEVICE_NAME);
+
+    if (IS_ERR(vmon.device)) {
+        ret = PTR_ERR(vmon.device);
+        vmon.device = NULL;
+        goto err_class;
     }
 
-    vmonitor_device = device_create(vmonitor_class, NULL, vmonitor_devno, NULL, DRIVER_NAME);
-    if (IS_ERR(vmonitor_device)) {
-        ret = PTR_ERR(vmonitor_device);
-        pr_err(DRIVER_NAME ": device_create basarisiz\n");
-        goto err_class_destroy;
-    }
+    ret = sysfs_create_group(&vmon.device->kobj,
+                             &vmonitor_attr_group);
+    if (ret)
+        goto err_device;
 
-    pr_info(DRIVER_NAME ": yuklendi, major=%d minor=%d\n",
-            MAJOR(vmonitor_devno), MINOR(vmonitor_devno));
+    mod_timer(&vmon.timer,
+              jiffies + msecs_to_jiffies(vmon.period_ms));
+
+    pr_info("vmonitor: loaded major=%d minor=%d\n",
+            MAJOR(vmon.devno),
+            MINOR(vmon.devno));
+
     return 0;
 
-err_class_destroy:
-    class_destroy(vmonitor_class);
-err_cdev_del:
-    cdev_del(&vdev->cdev);
+err_device:
+    device_destroy(vmon.class, vmon.devno);
+
+err_class:
+    class_destroy(vmon.class);
+
+err_cdev:
+    cdev_del(&vmon.cdev);
+
 err_unregister:
-    unregister_chrdev_region(vmonitor_devno, 1);
-err_free_dev:
-    kfree(vdev);
+    unregister_chrdev_region(vmon.devno, 1);
+
     return ret;
 }
 
 static void __exit vmonitor_exit(void)
 {
-    device_destroy(vmonitor_class, vmonitor_devno);
-    class_destroy(vmonitor_class);
-    cdev_del(&vdev->cdev);
-    unregister_chrdev_region(vmonitor_devno, 1);
-    kfree(vdev);
-    pr_info(DRIVER_NAME ": kaldirildi\n");
+    unsigned long flags;
+
+    mutex_lock(&vmon.control_lock);
+
+    spin_lock_irqsave(&vmon.lock, flags);
+    vmon.running = false;
+    spin_unlock_irqrestore(&vmon.lock, flags);
+
+    del_timer_sync(&vmon.timer);
+
+    mutex_unlock(&vmon.control_lock);
+
+    sysfs_remove_group(&vmon.device->kobj,
+                       &vmonitor_attr_group);
+
+    device_destroy(vmon.class, vmon.devno);
+    class_destroy(vmon.class);
+
+    cdev_del(&vmon.cdev);
+
+    unregister_chrdev_region(vmon.devno, 1);
+
+    pr_info("vmonitor: unloaded\n");
 }
 
 module_init(vmonitor_init);
 module_exit(vmonitor_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("vmonitor team");
+MODULE_DESCRIPTION("Virtual temperature monitor character device");
+MODULE_VERSION("1.0");
