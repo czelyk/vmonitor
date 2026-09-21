@@ -1,117 +1,254 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <string.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "event_loop.h"
 
-#define SERVER_PORT 5000
-#define BACKLOG 16
+#define DEFAULT_PORT 5000
+#define LISTEN_BACKLOG 64
 
-static int set_nonblocking(int fd)
+#define VMONITOR_DEVICE_PATH "/dev/vmonitor"
+
+static int parse_port(const char *text,
+                      unsigned short *port_out)
 {
-    int flags;
+    char *end;
+    long value;
 
-    flags = fcntl(fd, F_GETFL, 0);
+    if (text == NULL ||
+        port_out == NULL) {
 
-    if (flags < 0) {
+        errno = EINVAL;
+
         return -1;
     }
 
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+    errno = 0;
+
+    value =
+        strtol(text,
+               &end,
+               10);
+
+    if (errno != 0 ||
+        end == text ||
+        *end != '\0' ||
+        value < 1 ||
+        value > 65535) {
+
+        errno = EINVAL;
+
         return -1;
     }
+
+    *port_out =
+        (unsigned short)value;
 
     return 0;
 }
 
-int main(void)
+static int create_listen_socket(
+    unsigned short port)
 {
-    int server_fd;
-    int opt = 1;
+    struct sockaddr_in addr;
 
-    struct sockaddr_in server_addr;
+    int fd;
+    int one;
+    int flags;
 
-    /*
-     * 1. Create an IPv4 TCP socket.
-     */
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    one = 1;
 
-    if (server_fd < 0) {
-        perror("socket");
-        return EXIT_FAILURE;
-    }
+    fd =
+        socket(AF_INET,
+               SOCK_STREAM,
+               0);
 
-    /*
-     * 2. Allow the address/port to be reused.
-     */
-    if (setsockopt(server_fd,
+    if (fd < 0)
+        return -1;
+
+    if (setsockopt(fd,
                    SOL_SOCKET,
                    SO_REUSEADDR,
-                   &opt,
-                   sizeof(opt)) < 0) {
+                   &one,
+                   sizeof(one)) < 0) {
 
-        perror("setsockopt");
-        close(server_fd);
-        return EXIT_FAILURE;
+        close(fd);
+
+        return -1;
     }
 
     /*
-     * 3. Configure the server address.
+     * Non-blocking listening socket.
      */
-    memset(&server_addr, 0, sizeof(server_addr));
+    flags =
+        fcntl(fd,
+              F_GETFL,
+              0);
 
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_addr.sin_port = htons(SERVER_PORT);
+    if (flags < 0 ||
+        fcntl(fd,
+              F_SETFL,
+              flags | O_NONBLOCK) < 0) {
 
-    /*
-     * 4. Bind the socket to the configured address.
-     */
-    if (bind(server_fd,
-             (struct sockaddr *)&server_addr,
-             sizeof(server_addr)) < 0) {
+        close(fd);
 
-        perror("bind");
-        close(server_fd);
-        return EXIT_FAILURE;
+        return -1;
     }
 
     /*
-     * 5. Start listening for TCP connections.
+     * Do not leak the socket across exec().
      */
-    if (listen(server_fd, BACKLOG) < 0) {
-        perror("listen");
-        close(server_fd);
+    flags =
+        fcntl(fd,
+              F_GETFD,
+              0);
+
+    if (flags < 0 ||
+        fcntl(fd,
+              F_SETFD,
+              flags | FD_CLOEXEC) < 0) {
+
+        close(fd);
+
+        return -1;
+    }
+
+    memset(&addr,
+           0,
+           sizeof(addr));
+
+    addr.sin_family =
+        AF_INET;
+
+    addr.sin_addr.s_addr =
+        htonl(INADDR_ANY);
+
+    addr.sin_port =
+        htons(port);
+
+    if (bind(fd,
+             (struct sockaddr *)&addr,
+             sizeof(addr)) < 0) {
+
+        close(fd);
+
+        return -1;
+    }
+
+    if (listen(fd,
+               LISTEN_BACKLOG) < 0) {
+
+        close(fd);
+
+        return -1;
+    }
+
+    return fd;
+}
+
+static int open_driver(void)
+{
+    /*
+     * The server is the only userspace process
+     * that should open /dev/vmonitor.
+     */
+    return open(
+        VMONITOR_DEVICE_PATH,
+        O_RDWR |
+        O_NONBLOCK |
+        O_CLOEXEC
+    );
+}
+
+int main(int argc,
+         char **argv)
+{
+    unsigned short port;
+
+    int server_fd;
+    int driver_fd;
+    int rc;
+
+    port = DEFAULT_PORT;
+
+    if (argc > 2) {
+
+        fprintf(stderr,
+                "Usage: %s [port]\n",
+                argv[0]);
+
         return EXIT_FAILURE;
+    }
+
+    if (argc == 2) {
+
+        if (parse_port(argv[1],
+                       &port) < 0) {
+
+            fprintf(stderr,
+                    "Invalid TCP port: %s\n",
+                    argv[1]);
+
+            return EXIT_FAILURE;
+        }
     }
 
     /*
-     * 6. The listening socket must be non-blocking.
+     * Open the kernel driver once.
      */
-    if (set_nonblocking(server_fd) < 0) {
-        perror("fcntl(server_fd)");
-        close(server_fd);
+    driver_fd =
+        open_driver();
+
+    if (driver_fd < 0) {
+
+        perror("open(/dev/vmonitor)");
+
         return EXIT_FAILURE;
     }
 
-    printf("Server listening on port %d\n", SERVER_PORT);
-    printf("Listening socket is non-blocking\n");
+    server_fd =
+        create_listen_socket(port);
 
-    /*
-     * 7. Enter the epoll-based event loop.
-     */
-    if (event_loop_run(server_fd) < 0) {
-        close(server_fd);
+    if (server_fd < 0) {
+
+        perror("create_listen_socket");
+
+        close(driver_fd);
+
         return EXIT_FAILURE;
     }
+
+    printf(
+        "vmonitor server listening "
+        "on 0.0.0.0:%u\n",
+        port
+    );
+
+    printf(
+        "vmonitor driver opened: "
+        "%s fd=%d\n",
+        VMONITOR_DEVICE_PATH,
+        driver_fd
+    );
+
+    rc =
+        event_loop_run(server_fd,
+                       driver_fd);
 
     close(server_fd);
+    close(driver_fd);
 
-    return EXIT_SUCCESS;
+    return
+        rc == 0
+            ? EXIT_SUCCESS
+            : EXIT_FAILURE;
 }

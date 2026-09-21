@@ -116,23 +116,20 @@ int client_remove(int fd)
 
 int client_handle_read(struct client *client)
 {
-    if (client == NULL) {
-        errno = EINVAL;
-        return -1;
-    }
-
     for (;;) {
         size_t available;
         ssize_t received;
 
-        if (client->rx_len >= CLIENT_RX_BUFFER_SIZE) {
-            errno = EMSGSIZE;
-            return -1;
-        }
+        /*
+         * Calculate the remaining space in the
+         * client's receive buffer.
+         */
+        available = CLIENT_RX_BUFFER_SIZE - client->rx_len;
 
-        available =
-            CLIENT_RX_BUFFER_SIZE - client->rx_len;
-
+        /*
+         * Append newly received bytes after the data
+         * already stored in the RX buffer.
+         */
         received = recv(client->fd,
                         client->rx_buffer + client->rx_len,
                         available,
@@ -141,35 +138,52 @@ int client_handle_read(struct client *client)
         if (received > 0) {
             client->rx_len += (size_t)received;
 
+            /*
+             * Process every complete newline-terminated
+             * command currently stored in the RX buffer.
+             */
             for (;;) {
                 char *newline;
                 char line[CLIENT_RX_BUFFER_SIZE];
-
                 size_t line_len;
                 size_t remaining;
 
+                /*
+                 * Search for the first complete command.
+                 */
                 newline = memchr(client->rx_buffer,
                                  '\n',
                                  client->rx_len);
 
-                if (newline == NULL)
+                /*
+                 * No complete command is available yet.
+                 * Preserve the partial data for the next recv().
+                 */
+                if (newline == NULL) {
                     break;
+                }
 
+                /*
+                 * Calculate the command length without
+                 * including the newline character.
+                 */
                 line_len =
                     (size_t)(newline - client->rx_buffer);
 
+                /*
+                 * Copy the complete command into a
+                 * null-terminated temporary string.
+                 */
                 memcpy(line,
-                       client->rx_buffer,
-                       line_len);
+                    client->rx_buffer,
+                    line_len);
 
                 line[line_len] = '\0';
 
                 /*
-                 * Parsing only.
-                 *
-                 * Protocol command execution remains outside
-                 * the scope of client lifecycle handling.
-                 */
+                * Pass the complete command line to the
+                * protocol layer for parsing.
+                */
                 {
                     parsed_cmd_t cmd;
 
@@ -186,6 +200,11 @@ int client_handle_read(struct client *client)
                 client->rx_len = remaining;
             }
 
+            /*
+             * If the RX buffer is completely full and
+             * no newline was found, the client exceeded
+             * the maximum allowed command size.
+             */
             if (client->rx_len == CLIENT_RX_BUFFER_SIZE) {
                 errno = EMSGSIZE;
                 return -1;
@@ -195,16 +214,23 @@ int client_handle_read(struct client *client)
         }
 
         /*
-         * Orderly peer shutdown.
+         * recv() returning zero means that the peer
+         * closed the TCP connection.
          */
-        if (received == 0)
+        if (received == 0) {
             return 1;
 
-        if (errno == EINTR)
+        /*
+         * Retry recv() if it was interrupted by a signal.
+         */
+        if (errno == EINTR) {
             continue;
 
-        if (errno == EAGAIN ||
-            errno == EWOULDBLOCK)
+        /*
+         * No more data is currently available on the
+         * non-blocking socket.
+         */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return 0;
 
         return -1;
@@ -306,26 +332,10 @@ int client_handle_write(struct client *client)
             continue;
         }
 
-        if (sent == 0) {
-            errno = EPIPE;
-            return -1;
-        }
-
-        if (errno == EINTR)
-            continue;
-
-        if (errno == EAGAIN ||
-            errno == EWOULDBLOCK)
-            return 0;
-
         /*
-         * Fatal send error.
+         * Any other recv() error is treated as a
+         * client read failure.
          */
         return -1;
     }
-
-    client->tx_len = 0;
-    client->tx_sent = 0;
-
-    return 0;
 }
