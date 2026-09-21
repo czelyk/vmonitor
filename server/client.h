@@ -6,6 +6,11 @@
 #define CLIENT_RX_BUFFER_SIZE 4096
 #define CLIENT_TX_BUFFER_SIZE (64 * 1024)
 
+/*
+ * Maximum number of simultaneously connected TCP clients.
+ */
+#define CLIENT_MAX_COUNT 64
+
 struct client {
     int fd;
 
@@ -19,10 +24,24 @@ struct client {
     int watching;
 };
 
+/*
+ * Client lifecycle.
+ */
 int client_add(int fd);
-void client_remove(int fd);
+int client_remove(int fd);
 struct client *client_find(int fd);
 
+size_t client_count(void);
+int client_limit_reached(void);
+
+/*
+ * RX handling.
+ *
+ * Returns:
+ *   0  -> success / EAGAIN
+ *   1  -> peer closed connection
+ *  -1  -> fatal recv error / oversized command
+ */
 int client_handle_read(struct client *client);
 
 /*
